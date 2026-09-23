@@ -6,7 +6,8 @@
     {
       "class_name": "BotContainer",
       "image": "./Dockerfile",
-      "max_instances": 1
+      "max_instances": 1,
+      "instance_type": "standard-4"
     }
   ],
   "durable_objects": {
@@ -18,7 +19,7 @@
     { "tag": "v1", "new_sqlite_classes": ["BotContainer"] }
   ],
   "triggers": {
-    // Chay moi 5 phut de "chọc" container, giữ nó không bị Cloudflare cho ngủ (sleepAfter)
+    // Chay moi 5 phut de "choc" container, giữ nó không bị Cloudflare cho ngủ (sleepAfter)
     "crons": ["*/5 * * * *"]
   }
 }
