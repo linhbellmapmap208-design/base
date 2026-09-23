@@ -1,0 +1,14 @@
+{
+  "name": "discord-piano-bot-worker",
+  "version": "1.0.0",
+  "private": true,
+  "scripts": {
+    "deploy": "wrangler deploy"
+  },
+  "devDependencies": {
+    "wrangler": "^4"
+  },
+  "dependencies": {
+    "@cloudflare/containers": "latest"
+  }
+}

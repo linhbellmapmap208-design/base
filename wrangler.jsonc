@@ -1,0 +1,24 @@
+{
+  "name": "discord-piano-bot",
+  "main": "src/index.js",
+  "compatibility_date": "2026-09-23",
+  "containers": [
+    {
+      "class_name": "BotContainer",
+      "image": "./Dockerfile",
+      "max_instances": 1
+    }
+  ],
+  "durable_objects": {
+    "bindings": [
+      { "class_name": "BotContainer", "name": "BOT_CONTAINER" }
+    ]
+  },
+  "migrations": [
+    { "tag": "v1", "new_sqlite_classes": ["BotContainer"] }
+  ],
+  "triggers": {
+    // Chay moi 5 phut de "chọc" container, giữ nó không bị Cloudflare cho ngủ (sleepAfter)
+    "crons": ["*/5 * * * *"]
+  }
+}
