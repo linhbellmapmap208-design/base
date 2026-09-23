@@ -10,20 +10,35 @@ import traceback
 import time
 import sys
 import shutil
+import threading
+import http.server
 from pathlib import Path
-from urllib.parse import urlsplit
-import aiohttp
 import librosa
 import mido
+
+
+# ==================== HEALTH CHECK (chi can cho Cloudflare Containers) ====================
+# Cloudflare Container yeu cau container phai lang nghe 1 cong HTTP thi moi coi la "song".
+# Server nay khong lien quan gi den logic bot, chi tra ve "OK" de Cloudflare biet container van chay.
+def _start_health_server(port=8080):
+    class _Handler(http.server.BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"OK")
+        def log_message(self, format, *args):
+            pass  # im lang, khong spam log
+    server = http.server.HTTPServer(("0.0.0.0", port), _Handler)
+    threading.Thread(target=server.serve_forever, daemon=True).start()
 
 # ==================== CONFIG ====================
 DISCORD_TOKEN = os.environ.get("DISCORD_TOKEN", "").strip()
 ALLOWED_GUILD_ID = os.environ.get("GUILD_ID", "").strip()
 ALLOWED_CHANNEL_ID = os.environ.get("CHANNEL_ID", "").strip()
 SHOWCASE_CHANNEL_ID = os.environ.get("SHOWCASE_CHANNEL_ID", "").strip()  # tùy chọn
-TIKHUB_API_KEY = os.environ.get("TIKHUB_API_KEY", "").strip()  # https://user.tikhub.io
 MAX_FILE_SIZE_MB = 25
 MAX_DURATION_SECONDS = 540
+SHEET_DEFAULT_OCTAVE = 0         # 0 = khớp đàn Roblox khi "Chuyển đổi" = 0
 
 CACHE_DIR = "/tmp/teto_cache"
 os.makedirs(CACHE_DIR, exist_ok=True)
@@ -42,7 +57,7 @@ bot = commands.Bot(command_prefix="!", intents=intents)
 
 transcribe_lock = asyncio.Lock()
 queue_lock = asyncio.Lock()
-job_queue = []          # (interaction, source_type, source_data, queue_msg)
+job_queue = []          # (interaction, source_type, source_data, mode, octave, queue_msg)
 midi_cache = {}
 MAX_CACHE = 30
 
@@ -152,116 +167,97 @@ async def run_transkun(input_path, output_path, device="cpu", progress_callback=
         raise RuntimeError(f"Transkun failed: {' '.join(stderr_lines[-3:])}")
     return output_path
 
+async def get_audio_info(url):
+    import yt_dlp
+    loop = asyncio.get_event_loop()
+    with yt_dlp.YoutubeDL({'quiet': True, 'no_warnings': True}) as ydl:
+        return await loop.run_in_executor(None, ydl.extract_info, url, False) or {}
 
-# ==================== TIKHUB (YouTube / TikTok) ====================
-# Resolves a public YouTube/TikTok link to a direct, downloadable media URL
-# via the TikHub API (https://tikhub.io — PyPI package "tikhub").
-#
-# TikHub's official SDK is generated straight from their OpenAPI spec:
-# resource attribute = platform surface, method name = last path segment
-# (see https://docs.tikhub.io and the Swagger UI at https://api.tikhub.io).
-# The exact endpoint used to resolve a share URL can move between TikHub
-# spec versions, so each platform below lists a couple of likely
-# (resource, method, url_kwarg) candidates and we try them in order — the
-# first one that returns a usable media URL wins. If every candidate starts
-# failing, check the Swagger UI for the current endpoint name/parameter and
-# update this list; nothing else in the file needs to change.
-TIKHUB_ENDPOINTS = {
-    "tiktok": [
-        ("tiktok_web", "fetch_one_video", "url"),
-        ("tiktok_app_v3", "fetch_one_video", "url"),
-    ],
-    "youtube": [
-        ("youtube_web", "fetch_one_video", "url"),
-        ("youtube_web_v2", "fetch_one_video", "url"),
-    ],
+async def download_audio_url(url, tmpdir):
+    import yt_dlp
+    loop = asyncio.get_event_loop()
+    with yt_dlp.YoutubeDL({
+        'format': 'bestaudio/best',
+        'outtmpl': os.path.join(tmpdir, 'download.%(ext)s'),
+        'quiet': True, 'no_warnings': True, 'cookiefile': None,
+    }) as ydl:
+        await loop.run_in_executor(None, ydl.download, [url])
+    for f in os.listdir(tmpdir):
+        if f.startswith('download.'): return os.path.join(tmpdir, f)
+    raise FileNotFoundError("Download failed")
+
+
+# ==================== ROBLOX / VIRTUAL PIANO SHEET ====================
+# Đàn 61 phím trong Roblox (Chuyển đổi = 0): C2 (MIDI 36) = '1' ... C7 (MIDI 96) = 'm'
+_VP_KEYS = {
+    36: '1', 37: '!', 38: '2', 39: '@', 40: '3', 41: '4', 42: '$', 43: '5', 44: '%', 45: '6', 46: '^', 47: '7',
+    48: '8', 49: '*', 50: '9', 51: '(', 52: '0', 53: 'q', 54: 'Q', 55: 'w', 56: 'W', 57: 'e', 58: 'E', 59: 'r',
+    60: 't', 61: 'T', 62: 'y', 63: 'Y', 64: 'u', 65: 'i', 66: 'I', 67: 'o', 68: 'O', 69: 'p', 70: 'P', 71: 'a',
+    72: 's', 73: 'S', 74: 'd', 75: 'D', 76: 'f', 77: 'g', 78: 'G', 79: 'h', 80: 'H', 81: 'j', 82: 'J', 83: 'k',
+    84: 'l', 85: 'L', 86: 'z', 87: 'Z', 88: 'x', 89: 'c', 90: 'C', 91: 'v', 92: 'V', 93: 'b', 94: 'B', 95: 'n',
+    96: 'm',
 }
+VP_MIN, VP_MAX = 36, 96
 
-def detect_tikhub_platform(url):
-    host = urlsplit(url).netloc.lower()
-    if "tiktok.com" in host:
-        return "tiktok"
-    if "youtube.com" in host or "youtu.be" in host:
-        return "youtube"
-    return None
+def _fold_to_range(note):
+    while note < VP_MIN: note += 12
+    while note > VP_MAX: note -= 12
+    return note
 
-def _extract_media_url(node, trusted=False):
-    """Heuristically find a direct media URL inside a TikHub JSON payload.
-    A string is only trusted once we've descended through a key that looks
-    like a video/download field, so we don't accidentally grab a cover or
-    avatar image URL instead of the actual video."""
-    if isinstance(node, str):
-        return node if (trusted and node.startswith("http")) else None
-    if isinstance(node, dict):
-        for key, val in node.items():
-            kl = key.lower()
-            is_media_key = any(t in kl for t in (
-                "download_url", "play_addr", "play_url", "video_url",
-                "no_watermark", "nwm", "hd_play", "url_list"))
-            found = _extract_media_url(val, trusted=trusted or is_media_key)
-            if found: return found
-    elif isinstance(node, list):
-        for item in node:
-            found = _extract_media_url(item, trusted=trusted)
-            if found: return found
-    return None
+def midi_to_vp_sheet(midi_path, octave=SHEET_DEFAULT_OCTAVE, chord_window=0.06, max_tokens_per_line=24):
+    mid = mido.MidiFile(midi_path)
+    tpb = mid.ticks_per_beat or 480
+    tempo = 500000
+    t = 0.0
+    events = []
+    for msg in mido.merge_tracks(mid.tracks):
+        t += mido.tick2second(msg.time, tpb, tempo)
+        if msg.type == 'set_tempo':
+            tempo = msg.tempo
+        elif msg.type == 'note_on' and msg.velocity > 0:
+            events.append((t, msg.note))
+    if not events:
+        return "", 0, 0, 0
 
-def _extract_title(node, depth=0):
-    if depth > 6 or node is None: return None
-    if isinstance(node, dict):
-        for key in ("desc", "title", "video_title", "item_title"):
-            v = node.get(key)
-            if isinstance(v, str) and v.strip(): return v.strip()
-        for v in node.values():
-            found = _extract_title(v, depth + 1)
-            if found: return found
-    elif isinstance(node, list):
-        for item in node:
-            found = _extract_title(item, depth + 1)
-            if found: return found
-    return None
+    shift = octave * 12
+    events.sort(key=lambda e: e[0])
 
-async def tikhub_resolve(url):
-    """Return (media_url, title) for a YouTube/TikTok link using TikHub."""
-    if not TIKHUB_API_KEY:
-        raise RuntimeError("TIKHUB_API_KEY chưa được cấu hình trên server.")
-    platform = detect_tikhub_platform(url)
-    if not platform:
-        raise RuntimeError("Chỉ hỗ trợ link YouTube hoặc TikTok.")
-    from tikhub import AsyncTikHub
-    last_err = None
-    async with AsyncTikHub(api_key=TIKHUB_API_KEY) as client:
-        for resource_name, method_name, kwarg in TIKHUB_ENDPOINTS[platform]:
-            resource = getattr(client, resource_name, None)
-            method = getattr(resource, method_name, None) if resource else None
-            if method is None:
-                continue
-            try:
-                result = await method(**{kwarg: url})
-            except Exception as e:
-                last_err = e
-                continue
-            payload = result.model_dump() if hasattr(result, "model_dump") else result
-            media_url = _extract_media_url(payload)
-            if media_url:
-                return media_url, _extract_title(payload)
-    raise RuntimeError(f"TikHub không trả về media cho link này. ({last_err})")
+    buckets, folded = [], 0
+    for t, n in events:
+        n += shift
+        if not (VP_MIN <= n <= VP_MAX):
+            folded += 1
+            n = _fold_to_range(n)
+        if buckets and t - buckets[-1][0] <= chord_window:
+            buckets[-1][1].add(n)
+        else:
+            buckets.append([t, {n}])
 
-async def download_media_url(media_url, tmpdir):
-    async with aiohttp.ClientSession() as session:
-        async with session.get(media_url) as resp:
-            if resp.status != 200:
-                raise RuntimeError(f"Tải media thất bại (HTTP {resp.status})")
-            ctype = (resp.content_type or "").lower()
-            ext = ".m4a" if "audio" in ctype else ".mp4"
-            path_ext = os.path.splitext(urlsplit(media_url).path)[1]
-            if path_ext and len(path_ext) <= 5:
-                ext = path_ext
-            out_path = os.path.join(tmpdir, f"download{ext}")
-            with open(out_path, "wb") as fh:
-                async for chunk in resp.content.iter_chunked(1 << 16):
-                    fh.write(chunk)
-    return out_path
+    gaps = [buckets[i + 1][0] - buckets[i][0] for i in range(len(buckets) - 1)
+            if buckets[i + 1][0] - buckets[i][0] > 0]
+    median_gap = sorted(gaps)[len(gaps) // 2] if gaps else 0.25
+    median_gap = max(median_gap, 0.05)
+
+    lines, line, chord_count = [], [], 0
+    for i, (t, notes) in enumerate(buckets):
+        if i > 0:
+            units = (t - buckets[i - 1][0]) / median_gap
+            if units >= 4:
+                if line: lines.append(" ".join(line)); line = []
+            else:
+                rests = min(int(round(units)) - 1, 3)
+                if rests > 0: line.extend(["-"] * rests)
+        keys = [_VP_KEYS[n] for n in sorted(notes)]
+        if len(keys) > 1:
+            line.append("[" + "".join(keys) + "]")
+            chord_count += 1
+        else:
+            line.append(keys[0])
+        if len(line) >= max_tokens_per_line:
+            lines.append(" ".join(line)); line = []
+    if line: lines.append(" ".join(line))
+
+    return "\n".join(lines), len(events), chord_count, folded
 
 
 # ==================== EMBEDS ====================
@@ -289,7 +285,7 @@ class SustainButton(ui.Button):
         entry = midi_cache.get(interaction.message.id)
         if not entry:
             return await interaction.response.send_message(
-                "File này đã hết hạn trong cache, hãy `/transcriber` lại nhé.", ephemeral=True)
+                "File này đã hết hạn trong cache, hãy `/transcribe` lại nhé.", ephemeral=True)
         new_state = not entry['sustain']
         old_path = entry['midi_path']
         new_path = os.path.join(CACHE_DIR, f"{interaction.message.id}_{'on' if new_state else 'off'}.mid")
@@ -323,12 +319,35 @@ class MidiResultView(ui.LayoutView):
         row.add_item(SustainButton(e['sustain']))
         c.add_item(row)
 
-        tip = "Drop it into any MIDI player or virtual piano."
+        tip = "Drop it into any MIDI player or virtual piano. `/sheet` for QWERTY letters."
         if SHOWCASE_CHANNEL_ID:
             tip += f" Covers go in <#{SHOWCASE_CHANNEL_ID}>."
         c.add_item(ui.TextDisplay(f"-# {tip}"))
         if e['requester']:
             c.add_item(ui.TextDisplay(e['requester']))
+        self.add_item(c)
+
+
+# ==================== COMPONENTS V2: SHEET RESULT ====================
+class SheetResultView(ui.LayoutView):
+    """Khung kết quả /sheet: tiêu đề, thông số, file .txt nằm trong khung, hướng dẫn, mention."""
+    def __init__(self, display_name, filename, notes, chords, bpm, duration, octave, folded, requester):
+        super().__init__(timeout=None)
+        c = ui.Container()
+        c.add_item(ui.TextDisplay(f"## {display_name}"))
+        c.add_item(ui.TextDisplay(
+            f"`{notes} notes` `{chords} chords` `{bpm:.1f} BPM` `{format_duration(duration)}` "
+            f"`Chuyển đổi 0` `Octave {octave:+d}`"))
+        c.add_item(ui.Separator())
+        c.add_item(ui.File(f"attachment://{filename}"))
+
+        tip = ("`[abc]` bấm cùng lúc • `-` nghỉ • Chữ HOA và `!@$%^*(` là phím đen (Shift). "
+               "Đặt **Chuyển đổi = 0** trong game.")
+        if folded:
+            tip += f" `{folded}` nốt ngoài 61 phím đã gập về quãng 8 gần nhất."
+        c.add_item(ui.TextDisplay(f"-# {tip}"))
+        if requester:
+            c.add_item(ui.TextDisplay(requester))
         self.add_item(c)
 
 
@@ -396,18 +415,14 @@ async def prepare_audio(interaction, source_type, source_data, tmpdir, pm=None):
         except: pass
     else:
         url = source_data
-        platform = detect_tikhub_platform(url)
-        label = "TikTok" if platform == "tiktok" else "YouTube" if platform == "youtube" else "Link"
-        pm = await _show(interaction, pm, build_progress_embed(label, 5, "fetching via TikHub..."))
+        pm = await _show(interaction, pm, build_progress_embed("SoundCloud", 5, "fetching track info..."))
         try:
-            media_url, title = await tikhub_resolve(url)
-            display_name = title or truncate_url(url)
-        except Exception as e:
-            await pm.edit(embed=build_error_embed("TikHub Failed", f"```{e}```"))
-            return None
+            info = await get_audio_info(url)
+            display_name = info.get('title') or truncate_url(url)
+        except: display_name = truncate_url(url)
         try: await pm.edit(embed=build_progress_embed(display_name, 10, "downloading"))
         except: pass
-        try: input_path = await download_media_url(media_url, tmpdir)
+        try: input_path = await download_audio_url(url, tmpdir)
         except Exception as e:
             await pm.edit(embed=build_error_embed("Download Failed", f"```{e}```"))
             return None
@@ -444,7 +459,8 @@ async def _send_v2(interaction, progress_msg, view, file_path, filename):
         return new_msg
 
 
-async def process_transcribe_job(interaction, source_type, source_data, queue_msg=None):
+async def process_transcribe_job(interaction, source_type, source_data, mode="midi",
+                                 octave=SHEET_DEFAULT_OCTAVE, queue_msg=None):
     async with transcribe_lock:
         tmpdir_ctx = tempfile.TemporaryDirectory()
         tmpdir = tmpdir_ctx.__enter__()
@@ -465,6 +481,23 @@ async def process_transcribe_job(interaction, source_type, source_data, queue_ms
             base = Path(display_name).stem
             requester = interaction.user.mention if getattr(interaction, "user", None) else None
 
+            # ---------- /sheet (Components V2) ----------
+            if mode == "sheet":
+                sheet_text, note_total, chord_total, folded = midi_to_vp_sheet(result['midi_path'], octave=octave)
+                if not sheet_text:
+                    try: await progress_msg.edit(embed=build_error_embed("Error", "Could not generate sheet. No piano detected."))
+                    except: pass
+                    return
+                fn = f"{safe_filename(base)}_sheet.txt"
+                txt_path = os.path.join(tmpdir, fn)
+                with open(txt_path, "w", encoding="utf-8") as fh:
+                    fh.write(sheet_text)
+                view = SheetResultView(display_name, fn, note_total, chord_total, bpm, duration,
+                                       octave, folded, requester)
+                await _send_v2(interaction, progress_msg, view, txt_path, fn)
+                return
+
+            # ---------- /transcribe (Components V2) ----------
             fn = f"{safe_filename(base)}.mid"
             sustain = midi_has_sustain(result['midi_path'])
             entry = cache_midi(progress_msg.id, result['midi_path'], display_name, fn,
@@ -493,7 +526,7 @@ async def on_ready():
         print(f"Synced {len(synced)} command(s)")
     except Exception as e: print(f"Sync error: {e}")
     print(f"GUILD='{ALLOWED_GUILD_ID}' CH='{ALLOWED_CHANNEL_ID}'")
-    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="Song > MIDI"))
+    await bot.change_presence(activity=discord.Activity(type=discord.ActivityType.listening, name="MP3 > MIDI"))
 
 
 # ==================== SHARED VALIDATION ====================
@@ -522,19 +555,15 @@ async def _validate(interaction, file, url):
         if file.size / 1048576 > MAX_FILE_SIZE_MB:
             await interaction.response.send_message(embed=build_error_embed("Too large", f"{file.size/1048576:.1f}MB / {MAX_FILE_SIZE_MB}MB"), ephemeral=True)
             return False
-    if url:
-        if not url.startswith(("http://", "https://")):
-            await interaction.response.send_message(embed=build_error_embed("Bad URL", "Must start with http/https"), ephemeral=True)
-            return False
-        if detect_tikhub_platform(url) is None:
-            await interaction.response.send_message(embed=build_error_embed("Bad URL", "Only YouTube or TikTok links are supported."), ephemeral=True)
-            return False
+    if url and not url.startswith(("http://","https://")):
+        await interaction.response.send_message(embed=build_error_embed("Bad URL", "Must start with http/https"), ephemeral=True)
+        return False
     return True
 
 
 # ==================== QUEUE ====================
 async def _refresh_queue_positions():
-    for idx, (_, _, _, qm) in enumerate(job_queue, start=1):
+    for idx, (_, _, _, _, _, qm) in enumerate(job_queue, start=1):
         try: await qm.edit(embed=build_queue_embed(idx))
         except: pass
 
@@ -542,44 +571,61 @@ async def _drain_queue():
     while True:
         async with queue_lock:
             if not job_queue: break
-            ni, nt, nd, qm = job_queue.pop(0)
+            ni, nt, nd, nk, noct, qm = job_queue.pop(0)
             await _refresh_queue_positions()
-        await process_transcribe_job(ni, nt, nd, queue_msg=qm)
+        print(f"Queue: {nk}")
+        await process_transcribe_job(ni, nt, nd, mode=nk, octave=noct, queue_msg=qm)
 
-async def _enqueue_or_run(interaction, file, url):
+async def _enqueue_or_run(interaction, file, url, mode, octave=SHEET_DEFAULT_OCTAVE):
     st, sd = ("file", file) if file else ("url", url)
     await interaction.response.defer(thinking=True)
     async with queue_lock:
         if transcribe_lock.locked():
             p = len(job_queue) + 1
             qm = await interaction.followup.send(embed=build_queue_embed(p))
-            job_queue.append((interaction, st, sd, qm))
+            job_queue.append((interaction, st, sd, mode, octave, qm))
             return
-    await process_transcribe_job(interaction, st, sd)
+    await process_transcribe_job(interaction, st, sd, mode=mode, octave=octave)
     await _drain_queue()
 
 
-# ==================== /transcriber ====================
-@bot.tree.command(name="transcriber", description="Convert audio to MIDI")
-@app_commands.describe(file="Audio file (MP3, WAV, FLAC, OGG, M4A)", url="YouTube or TikTok link")
-async def transcriber_cmd(interaction: discord.Interaction, file: discord.Attachment = None, url: str = None):
+# ==================== /transcribe ====================
+@bot.tree.command(name="transcribe", description="Convert audio to MIDI")
+@app_commands.describe(file="Audio file (MP3, WAV, FLAC, OGG, M4A)", url="SoundCloud or audio URL")
+async def transcribe_cmd(interaction: discord.Interaction, file: discord.Attachment = None, url: str = None):
     if not await _check_access(interaction): return
     if not await _validate(interaction, file, url): return
-    await _enqueue_or_run(interaction, file, url)
+    await _enqueue_or_run(interaction, file, url, "midi")
+
+
+# ==================== /sheet ====================
+@bot.tree.command(name="sheet", description="Convert audio to a Roblox / Virtual Piano QWERTY sheet")
+@app_commands.describe(
+    file="Audio file (MP3, WAV, FLAC, OGG, M4A)",
+    url="SoundCloud or audio URL",
+    octave="Dịch quãng 8 (mặc định 0 = khớp đàn Roblox ở Chuyển đổi 0)")
+async def sheet_cmd(interaction: discord.Interaction, file: discord.Attachment = None, url: str = None,
+                    octave: app_commands.Range[int, -2, 2] = SHEET_DEFAULT_OCTAVE):
+    if not await _check_access(interaction): return
+    if not await _validate(interaction, file, url): return
+    await _enqueue_or_run(interaction, file, url, "sheet", octave=octave)
 
 
 # ==================== /help (chỉ người gọi lệnh thấy) ====================
 @bot.tree.command(name="help", description="Show bot guide")
 async def help_cmd(interaction: discord.Interaction):
     desc = (
-        "**/transcriber** `file` `url` — Turn a song into a playable piano MIDI.\n"
-        "Chuyển bài hát thành file MIDI piano có thể chơi được.\n"
+        "**/transcribe** `file` `url` — Turn a song into a playable piano MIDI.\n"
+        "Chuyển bài hát thành file MIDI piano có thể chơi được.\n\n"
+        "**/sheet** `file` `url` `octave` — Turn a song into a Roblox / Virtual Piano QWERTY sheet.\n"
+        "Chuyển bài hát thành sheet QWERTY khớp đàn Roblox (Chuyển đổi = 0).\n"
+        "`octave` từ -2 đến +2 nếu muốn hạ/nâng quãng (mặc định 0).\n"
     )
     e = discord.Embed(title="Commands", description=desc, color=COLOR_MAIN)
     e.add_field(
         name="Options",
         value=f"`file` — MP3, WAV, FLAC, OGG, M4A (tối đa {MAX_FILE_SIZE_MB}MB)\n"
-              f"`url`  — Link YouTube hoặc TikTok",
+              f"`url`  — SoundCloud hoặc link audio trực tiếp",
         inline=False)
     e.add_field(
         name="Limits",
@@ -595,4 +641,5 @@ if __name__ == "__main__":
     if not DISCORD_TOKEN:
         print("DISCORD_TOKEN missing!")
         exit(1)
+    _start_health_server(8080)  # bat health check truoc, de Cloudflare Container nhan la "da san sang"
     bot.run(DISCORD_TOKEN)
